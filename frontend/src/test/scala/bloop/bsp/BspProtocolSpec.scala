@@ -637,6 +637,7 @@ class BspProtocolSpec {
                 Assert.fail(s"Task id ${taskStart.taskId} is already added!")
               else startedTask.add(taskStart.taskId)
 
+              println(BspPrettyPrinter.taskStartParamsPrinter.show(taskStart))
               val json = taskStart.data.get
               bsp.CompileTask.decodeCompileTask(json.hcursor) match {
                 case Left(failure) =>

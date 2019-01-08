@@ -1,9 +1,10 @@
 package bloop.bsp
 
+import java.io.File
 import java.nio.file.Files
-import java.util.concurrent.ExecutionException
+import java.util.concurrent.{ConcurrentHashMap, ExecutionException}
 
-import bloop.cli.Commands
+import bloop.cli.{Commands, CommonOptions}
 import bloop.data.Project
 import bloop.engine.State
 import bloop.engine.caches.ResultsCache
@@ -13,6 +14,7 @@ import bloop.logging.{BspClientLogger, DebugFilter, RecordingLogger, Slf4jAdapte
 import bloop.util.TestUtil
 import ch.epfl.scala.bsp
 import ch.epfl.scala.bsp.endpoints
+import monix.eval.Task
 import monix.execution.{ExecutionModel, Scheduler}
 import monix.{eval => me}
 import org.scalasbt.ipcsocket.Win32NamedPipeSocket
@@ -161,6 +163,196 @@ object BspClientTest {
           retryBackoff(source, maxRetries - 1, firstDelay * 2)
             .delayExecution(firstDelay)
         else me.Task.raiseError(ex)
+    }
+  }
+
+  def testCompile(
+      bspCmd: Commands.ValidatedBsp,
+      compileTarget: bsp.BuildTargetIdentifier => Boolean
+  ): Unit = {
+    val compilationResults = new StringBuilder()
+    val logger = new BspClientLogger(new RecordingLogger)
+
+    def exhaustiveTestCompile(target: bsp.BuildTarget)(implicit client: LanguageClient) = {
+      def compileProject: Task[Either[Response.Error, bsp.CompileResult]] = {
+        endpoints.BuildTarget.compile
+          .request(bsp.CompileParams(List(target.id), None, None))
+          .map {
+            case Right(r) => compilationResults.++=(s"${r.statusCode}"); Right(r)
+            case Left(e) => Left(e)
+          }
+      }
+
+      val sourceDir = sourceDirectoryOf(AbsolutePath(ProjectUris.toPath(target.id.uri)))
+      Files.createDirectories(sourceDir.underlying)
+      val testIncrementalCompilationFile =
+        sourceDir.resolve("TestIncrementalCompilation.scala")
+      val testIncrementalCompilationFile2 =
+        sourceDir.resolve("TestIncrementalCompilation2.scala")
+      val testWarningFile = sourceDir.resolve("TestWarning.scala")
+
+      val testSourceDir =
+        testSourceDirectoryOf(AbsolutePath(ProjectUris.toPath(target.id.uri)))
+      Files.createDirectories(testSourceDir.underlying)
+      val junitTestSubclassFile = testSourceDir.resolve("JUnitTestSubclass.scala")
+
+      def deleteJUnitTestSubclassFile(): Boolean =
+        Files.deleteIfExists(junitTestSubclassFile.underlying)
+      def deleteTestIncrementalCompilationFiles(): Unit = {
+        Files.deleteIfExists(testWarningFile.underlying)
+        Files.deleteIfExists(testIncrementalCompilationFile.underlying)
+        Files.deleteIfExists(testIncrementalCompilationFile2.underlying)
+        ()
+      }
+
+      val driver = ???
+      val deleteAllResources =
+        Task { deleteTestIncrementalCompilationFiles(); deleteJUnitTestSubclassFile(); () }
+      driver.doOnCancel(deleteAllResources).doOnFinish(_ => deleteAllResources)
+    }
+
+    def clientWork(implicit client: LanguageClient) = {
+      endpoints.Workspace.buildTargets.request(bsp.WorkspaceBuildTargetsRequest()).flatMap { ts =>
+        ts match {
+          case Right(workspaceTargets) =>
+            workspaceTargets.targets.find(t => compileTarget(t.id)) match {
+              case Some(t) => exhaustiveTestCompile(t)
+              case None => Task.now(Left(Response.internalError(s"Missing '$MainProject'")))
+            }
+          case Left(error) =>
+            Task.now(Left(Response.internalError(s"Target request failed with $error.")))
+        }
+      }
+    }
+
+    val startedTask = scala.collection.mutable.HashSet[bsp.TaskId]()
+    val stringifiedDiagnostics = new ConcurrentHashMap[bsp.BuildTargetIdentifier, StringBuilder]()
+    val latestTaskIdPerTarget = new ConcurrentHashMap[bsp.BuildTargetIdentifier, String]()
+
+    val addServicesTest = { (s: Services) =>
+      val services = s
+        .notification(endpoints.Build.taskStart) { taskStart =>
+          taskStart.dataKind match {
+            case Some(bsp.TaskDataKind.CompileTask) =>
+              val json = taskStart.data.get
+              bsp.CompileTask.decodeCompileTask(json.hcursor) match {
+                case Left(failure) => ???
+                case Right(compileTask) =>
+                  // Keep the id of the started compilation task up to date to associate diagnostics
+                  latestTaskIdPerTarget.compute(
+                    compileTask.target,
+                    (btid, _) => taskStart.taskId.id
+                  )
+
+                  ???
+              }
+            case _ => ???
+          }
+        }
+        .notification(endpoints.Build.taskFinish) { taskFinish =>
+          taskFinish.dataKind match {
+            case Some(bsp.TaskDataKind.CompileReport) =>
+              val json = taskFinish.data.get
+              bsp.CompileReport.decodeCompileReport(json.hcursor) match {
+                case Left(failure) => ???
+                case Right(report) => ???
+              }
+            case _ => ???
+          }
+        }
+        .notification(endpoints.Build.publishDiagnostics) {
+          case p @ bsp.PublishDiagnosticsParams(tid, btid, _, diagnostics, reset) =>
+            stringifiedDiagnostics.compute(
+              btid,
+              (_, builder0) => {
+                val builder = if (builder0 == null) new StringBuilder() else builder0
+                val baseDir = {
+                  val wp = CommonOptions.default.workingPath
+                  if (wp.underlying.endsWith("frontend")) wp
+                  else wp.resolve("frontend")
+                }
+
+                //if (!tid.uri.value.startsWith("file:///")) ???
+
+                val latestId = Option(latestTaskIdPerTarget.get(btid)).getOrElse("no-id")
+                val relativePath = AbsolutePath(tid.uri.toPath).toRelative(baseDir)
+                val canonical = relativePath.toString.replace(File.separatorChar, '/')
+                val report =
+                  diagnostics.map(_.toString.replace("\n", " ").replace(System.lineSeparator, " "))
+                builder
+                  .++=(s"#$latestId: $canonical\n")
+                  .++=(s"  -> $report\n")
+                  .++=(s"  -> reset = $reset\n")
+              }
+            )
+        }
+    }
+
+    reportIfError(logger) {
+      BspClientTest.runTest(
+        bspCmd,
+        configDir,
+        logger,
+        addServicesTest,
+        addDiagnosticsHandler = false
+      )(c => clientWork(c))
+
+      val mainTarget = bsp.BuildTargetIdentifier(mainProject.bspUri)
+      val expectedMainDiagnostics =
+        s"""#1: src/test/resources/cross-test-build-0.6/test-project/shared/src/main/scala/hello/App.scala
+           |  -> List(Diagnostic(Range(Position(5,8),Position(5,8)),Some(Warning),None,None,local val in method main is never used,None))
+           |  -> reset = true
+           |#2: src/test/resources/cross-test-build-0.6/test-project/jvm/src/main/scala/TestIncrementalCompilation.scala
+           |  -> List(Diagnostic(Range(Position(2,29),Position(2,29)),Some(Error),None,None,type mismatch;  found   : String("")  required: Int,None))
+           |  -> reset = true
+           |#2: src/test/resources/cross-test-build-0.6/test-project/jvm/src/main/scala/TestIncrementalCompilation2.scala
+           |  -> List(Diagnostic(Range(Position(2,68),Position(2,68)),Some(Error),None,None,type mismatch;  found   : Int(1)  required: String,None))
+           |  -> reset = true
+           |#2: src/test/resources/cross-test-build-0.6/test-project/jvm/src/main/scala/TestWarning.scala
+           |  -> List(Diagnostic(Range(Position(2,36),Position(2,36)),Some(Warning),None,None,local val in method foo is never used,None))
+           |  -> reset = true
+           |#3: src/test/resources/cross-test-build-0.6/test-project/jvm/src/main/scala/TestIncrementalCompilation2.scala
+           |  -> List(Diagnostic(Range(Position(2,68),Position(2,68)),Some(Error),None,None,type mismatch;  found   : Int(1)  required: String,None))
+           |  -> reset = true
+           |#3: src/test/resources/cross-test-build-0.6/test-project/jvm/src/main/scala/TestIncrementalCompilation.scala
+           |  -> List()
+           |  -> reset = true
+           |#3: src/test/resources/cross-test-build-0.6/test-project/jvm/src/main/scala/TestWarning.scala
+           |  -> List()
+           |  -> reset = true
+           |#4: src/test/resources/cross-test-build-0.6/test-project/jvm/src/main/scala/TestIncrementalCompilation2.scala
+           |  -> List()
+           |  -> reset = true
+           |#5: src/test/resources/cross-test-build-0.6/test-project/jvm/src/main/scala/TestIncrementalCompilation.scala
+           |  -> List(Diagnostic(Range(Position(2,33),Position(2,33)),Some(Error),None,None,']' expected but ')' found.,None))
+           |  -> reset = true
+           |#6: src/test/resources/cross-test-build-0.6/test-project/jvm/src/main/scala/TestIncrementalCompilation.scala
+           |  -> List()
+           |  -> reset = true
+           |#7: No diagnostics for $mainTarget
+           |#8: No diagnostics for $mainTarget
+           |#9: No diagnostics for $mainTarget
+         """.stripMargin
+
+      // There must only be 5 compile reports with diagnostics in the main project
+      val obtainedMainDiagnostics =
+        findDiagnosticsReportUntil(mainTarget, stringifiedDiagnostics, totalMainCompilations)
+      TestUtil.assertNoDiff(expectedMainDiagnostics, obtainedMainDiagnostics)
+
+      val testTarget = bsp.BuildTargetIdentifier(testProject.bspUri)
+      val expectedTestDiagnostics =
+        s"""#1: No diagnostics for $testTarget
+           |#2: No diagnostics for $testTarget
+           |#3: No diagnostics for $testTarget
+           |#4: No diagnostics for $testTarget
+           |#5: No diagnostics for $testTarget
+           |#6: No diagnostics for $testTarget
+         """.stripMargin
+
+      // The compilation of the test project sends no diagnostics whatosever
+      val obtainedTestDiagnostics =
+        findDiagnosticsReportUntil(testTarget, stringifiedDiagnostics, totalTestCompilations)
+      TestUtil.assertNoDiff(expectedTestDiagnostics, obtainedTestDiagnostics)
     }
   }
 }
