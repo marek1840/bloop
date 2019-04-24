@@ -21,6 +21,7 @@ import ch.epfl.scala.bsp.ScalaBuildTarget.encodeScalaBuildTarget
 import ch.epfl.scala.bsp.{
   BuildTargetIdentifier,
   MessageType,
+  ScalaMainClass,
   ShowMessageParams,
   WorkspaceBuildTargets,
   endpoints
@@ -393,11 +394,12 @@ final class BloopBspServices(
     def run(
         id: BuildTargetIdentifier,
         project: Project,
+        mainClass: Option[ScalaMainClass],
         state: State
     ): Task[State] = {
       import bloop.engine.tasks.LinkTask.{linkMainWithJs, linkMainWithNative}
       val cwd = state.commonOptions.workingPath
-      val cmd = Commands.Run(List(project.name))
+      val cmd = Commands.Run(List(project.name), main = mainClass.map(_.`class`))
       Interpreter.getMainClass(state, project, cmd.main) match {
         case Left(state) =>
           Task.now(sys.error(s"Failed to run main class in ${project.name}"))
@@ -433,31 +435,57 @@ final class BloopBspServices(
           Task.now((state, Right(bsp.RunResult(None, bsp.StatusCode.Error))))
         case Right((tid, project)) =>
           val args = params.arguments.getOrElse(Nil)
-          compileProjects(List((tid, project)), state, args).flatMap {
-            case (newState, compileResult) =>
-              compileResult match {
-                case Right(result) =>
-                  var isCancelled: Boolean = false
-                  run(tid, project, newState)
-                    .doOnCancel(Task { isCancelled = true; () })
-                    .materialize
-                    .map(_.toEither)
-                    .map {
-                      case Left(e) =>
-                        val errorMsg =
-                          JsonRpcResponse.internalError(s"Failed test execution: ${e.getMessage}")
-                        (state, Left(errorMsg))
-                      case Right(state) =>
-                        val status = {
-                          val exitStatus = state.status
-                          if (isCancelled) bsp.StatusCode.Cancelled
-                          else if (exitStatus.isOk) bsp.StatusCode.Ok
-                          else bsp.StatusCode.Error
-                        }
-                        (state, Right(bsp.RunResult(None, status)))
-                    }
+          val mainClass = {
+            // FIXME after updating bsp get those values from params
+            import io.circe.Json
+            val kind = "bsp/ScalaMainClass"
+            val data: Option[Json] = None
+            data match {
+              case None =>
+                Right(None)
+              case Some(json) if kind == "bsp/ScalaMainClass" =>
+                json.as[ScalaMainClass] match {
+                  case Right(value) => Right(Some(value))
+                  case Left(error) => Left(error)
+                }
+              case _ =>
+                Left(new IllegalStateException("Unsupported data kind: " + kind))
+            }
+          }
 
-                case Left(error) => Task.now((state, Left(error)))
+          mainClass match {
+            case Left(error) =>
+              bspLogger.error(error)
+              Task.now((state, Right(bsp.RunResult(None, bsp.StatusCode.Error))))
+            case Right(main) =>
+              compileProjects(List((tid, project)), state, args).flatMap {
+                case (newState, compileResult) =>
+                  compileResult match {
+                    case Right(result) =>
+                      var isCancelled: Boolean = false
+                      run(tid, project, main, newState)
+                        .doOnCancel(Task { isCancelled = true; () })
+                        .materialize
+                        .map(_.toEither)
+                        .map {
+                          case Left(e) =>
+                            val errorMsg =
+                              JsonRpcResponse.internalError(
+                                s"Failed test execution: ${e.getMessage}"
+                              )
+                            (state, Left(errorMsg))
+                          case Right(state) =>
+                            val status = {
+                              val exitStatus = state.status
+                              if (isCancelled) bsp.StatusCode.Cancelled
+                              else if (exitStatus.isOk) bsp.StatusCode.Ok
+                              else bsp.StatusCode.Error
+                            }
+                            (state, Right(bsp.RunResult(None, status)))
+                        }
+
+                    case Left(error) => Task.now((state, Left(error)))
+                  }
               }
           }
       }
