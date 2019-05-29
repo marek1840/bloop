@@ -111,7 +111,7 @@ class BaseSuite extends TestSuite with BloopHelpers {
       dir: AbsolutePath
   )(implicit filename: sourcecode.File, line: sourcecode.Line): List[AttributedPath] = {
     import java.io.File
-    bloop.io.Paths
+    val files = bloop.io.Paths
       .attributedPathFilesUnder(dir, "glob:**.*", NoopLogger)
       .map { ap =>
         val prefixPath = dir.syntax.stripSuffix("/")
@@ -125,6 +125,8 @@ class BaseSuite extends TestSuite with BloopHelpers {
           ap.copy(path = AbsolutePath("/" + newPath))
         }
       }
+
+    files.sortBy(_.toString)
   }
 
   def list(
