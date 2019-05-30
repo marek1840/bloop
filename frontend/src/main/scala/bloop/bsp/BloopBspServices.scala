@@ -1,50 +1,35 @@
 package bloop.bsp
 
-import java.io.InputStream
 import java.net.URI
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
 import java.nio.file.FileSystems
-import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.{ConcurrentHashMap, TimeUnit}
+import java.util.concurrent.atomic.AtomicInteger
 
-import bloop.{CompileMode, Compiler, ScalaInstance}
 import bloop.cli.{Commands, ExitStatus, Validate}
-import bloop.dap.DebugAdapterServer
+import bloop.dap.{DebugServer, MainClassDebuggeeProvider}
 import bloop.data.{ClientInfo, Platform, Project}
-import bloop.engine.tasks.{CompileTask, Tasks, TestTask}
-import bloop.engine.tasks.toolchains.{ScalaJsToolchain, ScalaNativeToolchain}
 import bloop.engine._
+import bloop.engine.tasks.toolchains.{ScalaJsToolchain, ScalaNativeToolchain}
+import bloop.engine.tasks.{CompileTask, Tasks, TestTask}
 import bloop.internal.build.BuildInfo
 import bloop.io.{AbsolutePath, RelativePath}
 import bloop.logging.{BspServerLogger, DebugFilter}
 import bloop.reporter.{BspProjectReporter, ProblemPerPhase, ReporterConfig, ReporterInputs}
 import bloop.testing.{BspLoggingEventHandler, TestInternals}
-
+import bloop.{Compiler, ConnectionHandle, ScalaInstance}
 import ch.epfl.scala.bsp
 import ch.epfl.scala.bsp.ScalaBuildTarget.encodeScalaBuildTarget
-import ch.epfl.scala.bsp.{
-  BuildTargetIdentifier,
-  DebugSessionAddress,
-  MessageType,
-  ShowMessageParams,
-  WorkspaceBuildTargets,
-  endpoints
-}
-
-import scala.meta.jsonrpc.{JsonRpcClient, Response => JsonRpcResponse, Services => JsonRpcServices}
-
+import ch.epfl.scala.bsp.{BuildTargetIdentifier, MessageType, ShowMessageParams, endpoints}
 import monix.eval.Task
+import monix.execution.{Cancelable, Scheduler}
+import monix.execution.atomic.{AtomicBoolean, AtomicInt}
 import monix.reactive.Observer
-import monix.execution.Scheduler
-import monix.execution.atomic.AtomicInt
-import monix.execution.atomic.AtomicBoolean
 
 import scala.collection.concurrent.TrieMap
 import scala.concurrent.Promise
 import scala.concurrent.duration.FiniteDuration
-import scala.util.Success
-import scala.util.Failure
-import monix.execution.Cancelable
+import scala.meta.jsonrpc.{JsonRpcClient, Response => JsonRpcResponse, Services => JsonRpcServices}
+import scala.util.{Failure, Success}
 
 final class BloopBspServices(
     callSiteState: State,
@@ -407,23 +392,50 @@ final class BloopBspServices(
   def startDebugSession(
       params: bsp.DebugSessionParams
   ): BspEndpointResponse[bsp.DebugSessionAddress] = {
+    // TODO should be done better (how?)
+    def createRunner(): BspResponse[MainClassDebuggeeProvider] = {
+      val dataKind = params.parameters.dataKind
+      if (dataKind == "scala-main-class") {
+        params.parameters.data.as[bsp.ScalaMainClass] match {
+          case Left(error) =>
+            Left(JsonRpcResponse.invalidRequest(error.getMessage()))
+          case Right(mainClass) =>
+            Right(new MainClassDebuggeeProvider(mainClass))
+        }
+      } else {
+        Left(JsonRpcResponse.invalidRequest(s"Unsupported data kind: $dataKind"))
+      }
+    }
+
     ifInitialized { state =>
-      mapToProjects(params.targets, state) match {
-        case Left(error) =>
-          // Log the mapping error to the user via a log event + an error status code
-          bspLogger.error(error)
-          Task.now((state, Left(JsonRpcResponse.invalidRequest(error)))) // TODO do fail
-        case Right(mappings) =>
-          compileProjects(mappings, state, Nil).flatMap {
-            case (state, Left(error)) =>
-              Task.now((state, Left(error)))
-            case (state, Right(result)) if result.statusCode != bsp.StatusCode.Ok =>
-              Task.now((state, Left(JsonRpcResponse.internalError("Compilation not successful"))))
-            case (state, Right(_)) =>
-              val uri = DebugAdapterServer.createAdapter()(ioScheduler)
-              val address = bsp.DebugSessionAddress(uri.toString)
-              Task.now((state, Right(address)))
+      createRunner() match {
+        case Right(runner) =>
+          mapToProjects(params.targets, state) match {
+            case Left(error) =>
+              // Log the mapping error to the user via a log event + an error status code
+              bspLogger.error(error)
+              Task.now((state, Left(JsonRpcResponse.invalidRequest(error)))) // TODO do fail
+            case Right(mappings) =>
+              compileProjects(mappings, state, Nil).flatMap {
+                case (state, Left(error)) =>
+                  Task.now((state, Left(error)))
+                case (state, Right(result)) if result.statusCode != bsp.StatusCode.Ok =>
+                  Task.now(
+                    (state, Left(JsonRpcResponse.internalError("Compilation not successful")))
+                  )
+                case (state, Right(_)) =>
+                  val projects = mappings.map(_._2)
+                  val connection = ConnectionHandle.tcp(backlog = 10)
+                  val debuggeeFactory = runner.create(state, projects)(computationScheduler)
+                  val server = DebugServer.create(connection, debuggeeFactory)(ioScheduler)
+                  server.runAsync(ioScheduler)
+
+                  val response = Right(new bsp.DebugSessionAddress(connection.uri.toString))
+                  Task.now((state, response))
+              }
           }
+        case Left(error) =>
+          Task.now((state, Left(error)))
       }
     }
   }
