@@ -80,6 +80,21 @@ val jsonConfig210 = project
     }
   )
 
+val dap4s = project
+  .in(file("dap4s"))
+  .settings(
+    libraryDependencies ++= {
+      List(
+        Dependencies.circeParser,
+        Dependencies.circeCore,
+        Dependencies.circeGeneric,
+        Dependencies.circeDerivation,
+        "org.scalameta" %% "lsp4s" % "0.2.0",
+        compilerPlugin("org.scalamacros" % "paradise" % "2.1.1" cross CrossVersion.full)
+      )
+    }
+  )
+
 val jsonConfig211 = project
   .in(file("config"))
   .disablePlugins(ScriptedPlugin)
@@ -133,7 +148,7 @@ lazy val sockets: Project = project
 import build.BuildImplementation.jvmOptions
 // For the moment, the dependency is fixed
 lazy val frontend: Project = project
-  .dependsOn(sockets, backend, backend % "test->test", jsonConfig212)
+  .dependsOn(sockets, backend, backend % "test->test", jsonConfig212, dap4s)
   .disablePlugins(ScriptedPlugin)
   .enablePlugins(BuildInfoPlugin)
   .configs(IntegrationTest)

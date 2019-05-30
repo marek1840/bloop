@@ -1,20 +1,40 @@
 package bloop.dap
 
-import java.net.URI
+import java.net.{Socket, URI}
 
 import bloop.ConnectionHandle
-import monix.eval.Task
+import bloop.bsp.{BloopLanguageClient, BloopLanguageServer}
+import bloop.logging.{BspClientLogger, Logger}
 import monix.execution.Scheduler
 
-import scala.util.Success
+import scala.meta.jsonrpc.BaseProtocolMessage
 
-final object DebugAdapterServer {
-  def createAdapter()(implicit ioScheduler: Scheduler): URI = {
+object DebugAdapterServer {
+  def createAdapter()(logger: Logger, scheduler: Scheduler, ioScheduler: Scheduler): URI = {
     val server = createServer()
 
-    ioScheduler.executeAsync(() => server.serverSocket.accept())
+    ioScheduler.executeAsync { () =>
+      val socket = server.serverSocket.accept
+      initialize(socket)(logger, scheduler, ioScheduler)
+    }
 
     server.uri
+  }
+
+  def initialize(
+      socket: Socket
+  )(logger: Logger, scheduler: Scheduler, ioScheduler: Scheduler): Unit = {
+    val in = socket.getInputStream
+    val out = socket.getOutputStream
+
+    val serverLogger = new BspClientLogger(logger)
+    val messages = BaseProtocolMessage.fromInputStream(in, serverLogger)
+
+    val services = new DebugAdapterServices(serverLogger).services
+    val client = new BloopLanguageClient(out, serverLogger)
+    val server = new BloopLanguageServer(messages, client, services, scheduler, serverLogger)
+
+    val task = server.startTask.runAsync(ioScheduler)
   }
 
   private def createServer(): ConnectionHandle = {

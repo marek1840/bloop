@@ -388,7 +388,8 @@ final class BloopBspServices(
             case (state, Right(result)) if result.statusCode != bsp.StatusCode.Ok =>
               Task.now((state, Left(JsonRpcResponse.internalError("Compilation not successful"))))
             case (state, Right(_)) =>
-              val uri = DebugAdapterServer.createAdapter()(ioScheduler)
+              val uri =
+                DebugAdapterServer.createAdapter()(bspLogger, computationScheduler, ioScheduler)
               val address = bsp.DebugSessionAddress(uri.toString)
               Task.now((state, Right(address)))
           }

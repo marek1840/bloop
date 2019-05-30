@@ -1,9 +1,11 @@
 package bloop.bsp
 
+import java.net.URI
+
 import bloop.engine.{State, ExecutionContext}
 import bloop.cli.{Commands}
 import bloop.testing.BaseSuite
-
+import bloop.dap.DebugClient
 import bloop.cli.{Commands, CommonOptions, Validate, CliOptions, BspProtocol}
 import bloop.data.{Project, ClientInfo}
 import bloop.engine.{State, Run}
@@ -32,8 +34,6 @@ import java.util.concurrent.ExecutionException
 import scala.concurrent.Promise
 import scala.concurrent.duration.FiniteDuration
 import scala.meta.jsonrpc.{BaseProtocolMessage, LanguageClient, LanguageServer, Response, Services}
-
-import monix.execution.Scheduler
 
 abstract class BspBaseSuite extends BaseSuite with BspClientTest {
   final class UnmanagedBspTestState(
@@ -232,7 +232,7 @@ abstract class BspBaseSuite extends BaseSuite with BspClientTest {
       TestUtil.await(FiniteDuration(5, "s"))(task)
     }
 
-    def startDebugSession(project: TestProject, mainClass: String): bsp.DebugSessionAddress = {
+    def startDebugSession(project: TestProject, mainClass: String): DebugClient = {
       val task = runAfterTargets(project) { target =>
         val params = {
           val targets = List(target)
@@ -248,7 +248,12 @@ abstract class BspBaseSuite extends BaseSuite with BspClientTest {
         }
       }
 
-      TestUtil.await(FiniteDuration(5, "s"))(task)
+      val session = for {
+        address <- task
+        uri = URI.create(address.uri)
+      } yield DebugClient(uri)(defaultScheduler)
+
+      TestUtil.await(FiniteDuration(5, "s"))(session)
     }
 
     def scalaOptions(project: TestProject): (ManagedBspTestState, bsp.ScalacOptionsResult) = {
