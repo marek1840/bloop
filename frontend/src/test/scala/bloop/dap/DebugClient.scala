@@ -2,23 +2,13 @@ package bloop.dap
 
 import java.net.{Socket, URI}
 
-import bloop.bsp.{BloopLanguageClient, BloopLanguageServer}
-import bloop.logging.{BspClientLogger, NoopLogger}
-import dap4s.{DAP, InitializeRequest, InitializeResponse}
+import dap4s._
 import monix.eval.Task
 import monix.execution.Scheduler
-
-import scala.meta.jsonrpc.{
-  BaseProtocolMessage,
-  JsonRpcClient,
-  MessageWriter,
-  Response => JsonRpcResponse,
-  Services => JsonRpcServices
-}
-final class DebugClient(implicit client: JsonRpcClient) {
+final class DebugClient(implicit client: DebugAdapterProxy) {
   def initialize(): Task[InitializeResponse] = {
     val params = new InitializeRequest
-    DAP.initialize.request(params).orFail
+    DAP.initialize.request2(params, client)
   }
 
   private implicit class ResponseAdapter[A](task: Task[Either[_, A]]) {
@@ -30,18 +20,16 @@ final class DebugClient(implicit client: JsonRpcClient) {
 }
 
 object DebugClient {
-  def apply(uri: URI)(implicit scheduler: Scheduler): DebugClient = {
+  def apply(uri: URI)(scheduler: Scheduler): DebugClient = {
     val socket = new Socket(uri.getHost, uri.getPort)
-    val in = socket.getInputStream
-    val out = socket.getOutputStream
+    val channel = Channel
+      .from(socket)
+      .wrapWith(BaseMessage.channel(_)(null))
+      .wrapWith(DebugMessage.channel)
 
-    val logger = new BspClientLogger(NoopLogger)
-    val messages = BaseProtocolMessage.fromInputStream(in, logger)
-    implicit val client: BloopLanguageClient = new BloopLanguageClient(out, logger)
-
-    val services = JsonRpcServices.empty(new BspClientLogger(NoopLogger))
-    val server = new BloopLanguageServer(messages, client, services, scheduler, logger)
-    server.startTask.runAsync(scheduler)
+    val services = JsonServices.empty
+    implicit val proxy = new DebugAdapterProxy(channel, services)(scheduler)
+    proxy.listen(scheduler)
 
     new DebugClient
   }
