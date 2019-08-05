@@ -244,11 +244,11 @@ object DebugServerSpec extends BspBaseSuite {
       state: DebugServerSpec.ManagedBspTestState
   ): DebuggeeRunner = {
     val testState = state.toTestState
-    DebuggeeRunner.forMainClass(
-      Seq(testState.getProjectFor(project)),
-      new ScalaMainClass("Main", Nil, Nil),
-      testState.state
-    ) match {
+    val main = new ScalaMainClass("Main", Nil, Nil)
+    val factory =
+      DebuggeeRunner.forMainClass(Seq(testState.getProjectFor(project)), Task(testState.state))(_)
+
+    factory(main) match {
       case Right(value) => value
       case Left(error) => throw new Exception(error)
     }

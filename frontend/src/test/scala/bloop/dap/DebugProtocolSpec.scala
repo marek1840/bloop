@@ -4,10 +4,12 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 
 import bloop.cli.BspProtocol
+import bloop.dap.DebugTestProtocol.Response.{Failure, Success}
 import bloop.logging.RecordingLogger
 import bloop.util.{TestProject, TestUtil}
 import ch.epfl.scala.bsp
 import ch.epfl.scala.bsp.LaunchParametersDataKind._
+import monix.eval.Task
 
 object DebugProtocolSpec extends DebugBspBaseSuite {
   override val protocol: BspProtocol = BspProtocol.Local
@@ -82,9 +84,8 @@ object DebugProtocolSpec extends DebugBspBaseSuite {
   }
 
   test("picks up source changes across sessions") {
-    val correctMain =
-      """
-        |object Main {
+    val changedVersion =
+      """object Main {
         |  def main(args: Array[String]): Unit = {
         |    println("Non-blocking Hello!")
         |  }
@@ -92,7 +93,7 @@ object DebugProtocolSpec extends DebugBspBaseSuite {
      """.stripMargin
 
     TestUtil.withinWorkspace { workspace =>
-      val main =
+      val originalVersion =
         """|/main/scala/Main.scala
            |object Main {
            |  def main(args: Array[String]): Unit = {
@@ -103,7 +104,7 @@ object DebugProtocolSpec extends DebugBspBaseSuite {
            |""".stripMargin
 
       val logger = new RecordingLogger(ansiCodesSupported = false)
-      val project = TestProject(workspace, "p", List(main))
+      val project = TestProject(workspace, "p", List(originalVersion))
 
       loadBspState(workspace, List(project), logger) { state =>
         // start debug session and the immediately disconnect from it
@@ -122,8 +123,8 @@ object DebugProtocolSpec extends DebugBspBaseSuite {
 
         // fix the main class
         val sources = state.toTestState.getProjectFor(project).sources
-        val mainFile = sources.head.resolve("Main.scala")
-        Files.write(mainFile.underlying, correctMain.getBytes(StandardCharsets.UTF_8))
+        val mainFile = sources.head.resolve("main/scala/Main.scala")
+        Files.write(mainFile.underlying, changedVersion.getBytes(StandardCharsets.UTF_8))
 
         // start the next debug session
         val output = state.withDebugSession(project, mainClassParams("Main")) { client =>
@@ -139,6 +140,108 @@ object DebugProtocolSpec extends DebugBspBaseSuite {
         }
 
         assertNoDiff(output, "Non-blocking Hello!")
+      }
+    }
+  }
+
+  test("picks up source changes across restarts") {
+    val changedVersion =
+      """object Main {
+        |  def main(args: Array[String]): Unit = {
+        |    println("Non-blocking Hello!")
+        |  }
+        |}
+     """.stripMargin
+
+    TestUtil.withinWorkspace { workspace =>
+      val originalVersion =
+        """|/main/scala/Main.scala
+           |object Main {
+           |  def main(args: Array[String]): Unit = {
+           |    println("Blocking Hello!")
+           |    synchronized(wait())
+           |  }
+           |}
+           |""".stripMargin
+
+      val logger = new RecordingLogger(ansiCodesSupported = false)
+      val project = TestProject(workspace, "p", List(originalVersion))
+
+      loadBspState(workspace, List(project), logger) { state =>
+        // start debug session and the immediately disconnect from it
+        state.withDebugSession(project, mainClassParams("Main")) { client =>
+          for {
+            _ <- client.initialize()
+            _ <- client.launch()
+            _ <- client.configurationDone()
+            originalOutput <- client.firstOutput
+            _ <- Task {
+              // fix the main class
+              val sources = state.toTestState.getProjectFor(project).sources
+              val mainFile = sources.head.resolve("main/scala/Main.scala")
+              Files.write(mainFile.underlying, changedVersion.getBytes(StandardCharsets.UTF_8))
+            }
+            _ <- client.restart()
+            _ <- client.initialize()
+            _ <- client.launch()
+            _ <- client.configurationDone()
+            _ <- client.exited
+            _ <- client.terminated
+            _ <- client.disconnect()
+            changedOutput <- client.allOutput
+          } yield {
+            assertNoDiff(originalOutput, "Blocking Hello!")
+            assertNoDiff(changedOutput, "Non-blocking Hello!")
+          }
+        }
+      }
+    }
+  }
+
+  test("fails to restart if the recompilation fails") {
+    val changedVersion =
+      """object Main { // compile error
+     """.stripMargin
+
+    TestUtil.withinWorkspace { workspace =>
+      val originalVersion =
+        """|/main/scala/Main.scala
+           |object Main {
+           |  def main(args: Array[String]): Unit = {
+           |    println("Blocking Hello!")
+           |    synchronized(wait())
+           |  }
+           |}
+           |""".stripMargin
+
+      val logger = new RecordingLogger(ansiCodesSupported = false)
+      val project = TestProject(workspace, "p", List(originalVersion))
+
+      loadBspState(workspace, List(project), logger) { state =>
+        // start debug session and the immediately disconnect from it
+        state.withDebugSession(project, mainClassParams("Main")) { client =>
+          for {
+            _ <- client.initialize()
+            _ <- client.launch()
+            _ <- client.configurationDone()
+            _ <- Task {
+              val sources = state.toTestState.getProjectFor(project).sources
+              val mainFile = sources.head.resolve("main/scala/Main.scala")
+              Files.write(mainFile.underlying, changedVersion.getBytes(StandardCharsets.UTF_8))
+            }
+            _ <- client.restart()
+            _ <- client.initialize()
+            launched <- client.launch()
+            _ <- client.disconnect()
+          } yield {
+            launched match {
+              case Success(_) =>
+                fail("Debuggee should not start when a source file is uncompilable")
+              case Failure(message) =>
+                assertNoDiff(message, "Could not start debuggee")
+            }
+          }
+        }
       }
     }
   }
