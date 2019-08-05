@@ -470,7 +470,7 @@ final class BloopBspServices(
   ): BspEndpointResponse[bsp.DebugSessionAddress] = {
     def inferDebuggeeRunner(
         projects: Seq[Project],
-        state: State
+        recompile: Task[State]
     ): BspResponse[DebuggeeRunner] = {
       def convert[A: Decoder](
           f: A => Either[String, DebuggeeRunner]
@@ -488,9 +488,9 @@ final class BloopBspServices(
 
       params.parameters.dataKind match {
         case LaunchParametersDataKind.scalaMainClass =>
-          convert[bsp.ScalaMainClass](main => DebuggeeRunner.forMainClass(projects, main, state))
+          convert[bsp.ScalaMainClass](DebuggeeRunner.forMainClass(projects, recompile))
         case LaunchParametersDataKind.scalaTestSuites =>
-          convert[List[String]](filters => DebuggeeRunner.forTestSuite(projects, filters, state))
+          convert[List[String]](DebuggeeRunner.forTestSuite(projects, recompile))
         case dataKind => Left(JsonRpcResponse.invalidRequest(s"Unsupported data kind: $dataKind"))
       }
     }
@@ -511,7 +511,11 @@ final class BloopBspServices(
               bspLogger.error(error)
               Task.now((state, Left(JsonRpcResponse.invalidRequest(error))))
             case Right(mappings) =>
-              compileProjects(mappings, state, Nil).flatMap {
+              val projects = mappings.map(_._2)
+
+              val compile = Task.eval(compileProjects(mappings, state, Nil)).flatten
+
+              compile.flatMap {
                 case (state, Left(error)) =>
                   Task.now((state, Left(error)))
                 case (state, Right(result)) if result.statusCode != bsp.StatusCode.Ok =>
@@ -519,8 +523,19 @@ final class BloopBspServices(
                     (state, Left(JsonRpcResponse.internalError("Compilation not successful")))
                   )
                 case (state, Right(_)) =>
-                  val projects = mappings.map(_._2)
-                  inferDebuggeeRunner(projects, state) match {
+                  // recompile task ensures the debuggee always has the up to date resources
+                  // even after restarting
+                  val recompile = compile.flatMap {
+                    case (_, Left(cause)) =>
+                      Task.raiseError(new IllegalStateException(cause.error.message))
+                    case (_, Right(result)) if result.statusCode != bsp.StatusCode.Ok =>
+                      val error = new IllegalStateException("Compilation not successful")
+                      Task.raiseError(error)
+                    case (state, _) =>
+                      Task.now(state)
+
+                  }
+                  inferDebuggeeRunner(projects, recompile) match {
                     case Right(runner) =>
                       val startedServer = DebugServer.start(runner, bspLogger, ioScheduler)
                       val listenAndUnsubscribe = startedServer.listen

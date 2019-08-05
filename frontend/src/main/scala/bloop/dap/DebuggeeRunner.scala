@@ -16,63 +16,65 @@ private final class MainClassDebugAdapter(
     project: Project,
     mainClass: ScalaMainClass,
     env: JavaEnv,
-    state: State
+    recompile: Task[State]
 ) extends DebuggeeRunner {
   def run(debugLogger: DebugSessionLogger): Task[Unit] = {
-    val workingDir = state.commonOptions.workingPath
-    val runState = Tasks.runJVM(
-      state.copy(logger = debugLogger),
-      project,
-      env,
-      workingDir,
-      mainClass.`class`,
-      mainClass.arguments.toArray,
-      skipJargs = false,
-      RunMode.Debug
-    )
+    val task = recompile.flatMap { state =>
+      val workingDir = state.commonOptions.workingPath
+      Tasks.runJVM(
+        state.copy(logger = debugLogger),
+        project,
+        env,
+        workingDir,
+        mainClass.`class`,
+        mainClass.arguments.toArray,
+        skipJargs = false,
+        RunMode.Debug
+      )
+    }
 
-    runState.map(_ => ())
+    task.map(_ => ())
   }
 }
 
 private final class TestSuiteDebugAdapter(
     projects: Seq[Project],
     filters: List[String],
-    state: State
+    recompile: Task[State]
 ) extends DebuggeeRunner {
   def run(debugLogger: DebugSessionLogger): Task[Unit] = {
-    val debugState = state.copy(logger = debugLogger)
+    val task = recompile.flatMap { state =>
+      val debugState = state.copy(logger = debugLogger)
 
-    val filter = TestInternals.parseFilters(filters)
-    val handler = new LoggingEventHandler(debugState.logger)
+      val filter = TestInternals.parseFilters(filters)
+      val handler = new LoggingEventHandler(debugState.logger)
 
-    val task = Tasks.test(
-      debugState,
-      projects.toList,
-      Nil,
-      filter,
-      handler,
-      failIfNoTestFrameworks = true,
-      runInParallel = false,
-      mode = RunMode.Debug
-    )
+      Tasks.test(
+        debugState,
+        projects.toList,
+        Nil,
+        filter,
+        handler,
+        failIfNoTestFrameworks = true,
+        runInParallel = false,
+        mode = RunMode.Debug
+      )
+    }
 
     task.map(_ => ())
   }
 }
 
 object DebuggeeRunner {
-  def forMainClass(
-      projects: Seq[Project],
-      mainClass: ScalaMainClass,
-      state: State
+  def forMainClass(projects: Seq[Project], recompile: Task[State])(
+      mainClass: ScalaMainClass
   ): Either[String, DebuggeeRunner] = {
     projects match {
       case Seq() => Left(s"No projects specified for main class: [$mainClass]")
       case Seq(project) =>
         project.platform match {
           case jvm: Platform.Jvm =>
-            Right(new MainClassDebugAdapter(project, mainClass, jvm.env, state))
+            Right(new MainClassDebugAdapter(project, mainClass, jvm.env, recompile))
           case platform =>
             Left(s"Unsupported platform: ${platform.getClass.getSimpleName}")
         }
@@ -81,14 +83,12 @@ object DebuggeeRunner {
     }
   }
 
-  def forTestSuite(
-      projects: Seq[Project],
-      filters: List[String],
-      state: State
+  def forTestSuite(projects: Seq[Project], recompile: Task[State])(
+      filters: List[String]
   ): Either[String, DebuggeeRunner] = {
     projects match {
       case Seq() => Left(s"No projects specified for the test suites: [${filters.sorted}]")
-      case projects => Right(new TestSuiteDebugAdapter(projects, filters, state))
+      case projects => Right(new TestSuiteDebugAdapter(projects, filters, recompile))
     }
   }
 }
