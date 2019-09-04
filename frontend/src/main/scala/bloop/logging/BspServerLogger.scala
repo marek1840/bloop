@@ -1,6 +1,7 @@
 package bloop.logging
 
 import java.io.File
+import java.net.{InetSocketAddress, URI}
 import java.util.concurrent.atomic.AtomicInteger
 
 import bloop.data.Project
@@ -11,8 +12,8 @@ import xsbti.Severity
 
 import scala.meta.jsonrpc.JsonRpcClient
 import ch.epfl.scala.bsp
-import ch.epfl.scala.bsp.BuildTargetIdentifier
-import ch.epfl.scala.bsp.endpoints.Build
+import ch.epfl.scala.bsp.{BuildTargetIdentifier, DebugSessionAddress}
+import ch.epfl.scala.bsp.endpoints.{Build, DebugSession}
 import monix.execution.atomic.AtomicInt
 
 /**
@@ -210,6 +211,11 @@ final class BspServerLogger private (
       )
     )
     ()
+  }
+
+  def publishDebuggeeAttachable(port: Int): Unit = {
+    val notification = bsp.DebugSessionAddress(originId, s"tcp://localhost:$port")
+    DebugSession.debuggeeAttachable.notify(notification)
   }
 }
 

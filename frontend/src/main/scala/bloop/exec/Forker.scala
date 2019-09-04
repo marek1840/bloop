@@ -2,21 +2,22 @@ package bloop.exec
 
 import java.io.File.pathSeparator
 import java.nio.file.Files
-import java.net.URLClassLoader
+import java.net.{InetSocketAddress, URI, URLClassLoader}
 import java.nio.ByteBuffer
 import java.io.IOException
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.{ConcurrentHashMap, TimeUnit}
+import java.util.function.Supplier
 
 import bloop.cli.{CommonOptions, ExitStatus}
 import bloop.engine.ExecutionContext
+import bloop.exec.Forker.JvmProcessLogger
 import bloop.io.AbsolutePath
-import bloop.logging.{DebugFilter, Logger}
-
+import bloop.logging.{BspServerLogger, CompilationEvent, DebugFilter, Logger}
 import com.zaxxer.nuprocess.{NuAbstractProcessHandler, NuProcess}
-
 import monix.eval.Task
 import monix.execution.Cancelable
+import monix.execution.atomic.{Atomic, AtomicBoolean}
 import monix.execution.misc.NonFatal
 
 import scala.concurrent.duration.FiniteDuration
@@ -29,7 +30,7 @@ import scala.concurrent.duration.FiniteDuration
  * @param javaEnv   The configuration describing how to start the new JVM
  * @param classpath The full classpath with which the code should be executed
  */
-final case class Forker(javaEnv: JavaEnv, classpath: Array[AbsolutePath]) {
+case class Forker(javaEnv: JavaEnv, classpath: Array[AbsolutePath]) {
 
   /**
    * Creates a `ClassLoader` from the classpath of this `ForkProcess`
@@ -60,7 +61,7 @@ final case class Forker(javaEnv: JavaEnv, classpath: Array[AbsolutePath]) {
       mainClass: String,
       args0: Array[String],
       skipJargs: Boolean,
-      logger: Logger,
+      logger0: Logger,
       opts: CommonOptions,
       extraClasspath: Array[AbsolutePath] = Array.empty
   ): Task[Int] = {
@@ -73,6 +74,9 @@ final case class Forker(javaEnv: JavaEnv, classpath: Array[AbsolutePath]) {
     val classpathOption = "-cp" :: fullClasspath :: Nil
     val appOptions = mainClass :: userArgs.toList
     val cmd = java.syntax :: jvmOptions.toList ::: classpathOption ::: appOptions
+
+    val logger = new JvmProcessLogger(logger0)
+
     val logTask =
       if (logger.isVerbose) {
         val debugOptions =
@@ -272,5 +276,63 @@ object Forker {
           }
         } else Array.empty[String]
     }
+  }
+
+  def forJvm(javaEnv: JavaEnv, classpath: Array[AbsolutePath]): Forker = {
+    ???
+  }
+
+  final class JvmForker(javaEnv: JavaEnv, classpath: Array[AbsolutePath])
+      extends Forker(javaEnv, classpath) {
+    override def runMain(
+        cwd: AbsolutePath,
+        mainClass: String,
+        args0: Array[String],
+        skipJargs: Boolean,
+        logger0: Logger,
+        opts: CommonOptions,
+        extraClasspath: Array[AbsolutePath]
+    ): Task[Int] = {
+      val logger = new JvmProcessLogger(logger0)
+      super.runMain(cwd, mainClass, args0, skipJargs, logger, opts, extraClasspath)
+    }
+  }
+
+  final class JvmProcessLogger(val logger: Logger) extends Logger {
+    private val prefix = "Listening for transport dt_socket at address: "
+
+    override def info(msg: String): Unit = {
+      logger match {
+        case bspLogger: BspServerLogger if msg.startsWith(prefix) =>
+          val port = Integer.parseInt(msg.drop(prefix.length))
+          bspLogger.publishDebuggeeAttachable(port)
+        case _ =>
+          logger.info(msg)
+      }
+    }
+
+    override def name: String = logger.name
+    override def isVerbose: Boolean = logger.isVerbose
+    override def asVerbose: Logger = logger.asVerbose
+    override def asDiscrete: Logger = logger.asDiscrete
+    override def withOriginId(originId: Option[String]): Logger = logger.withOriginId(originId)
+    override def debugFilter: DebugFilter = logger.debugFilter
+    override def debug(msg: String)(implicit ctx: DebugFilter): Unit = logger.debug(msg)(ctx)
+    override def debug(msg: Supplier[String]): Unit = logger.debug(msg)
+    override def error(msg: Supplier[String]): Unit = logger.error(msg)
+    override def warn(msg: Supplier[String]): Unit = logger.warn(msg)
+    override def info(msg: Supplier[String]): Unit = logger.info(msg)
+    override def trace(exception: Supplier[Throwable]): Unit = logger.trace(exception)
+    override def report(msg: String, t: Throwable): Unit = logger.report(msg, t)
+    override def handleCompilationEvent(event: CompilationEvent): Unit =
+      logger.handleCompilationEvent(event)
+
+    override def displayWarningToUser(msg: String): Unit = logger.displayWarningToUser(msg)
+    override def ansiCodesSupported(): Boolean = logger.ansiCodesSupported()
+    override def error(msg: String): Unit = logger.error(msg)
+    override def warn(msg: String): Unit = logger.warn(msg)
+    override def trace(t: Throwable): Unit = logger.trace(t)
+
+    def printDebug(line: String): Unit = ()
   }
 }

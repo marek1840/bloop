@@ -3,14 +3,14 @@ package bloop.bsp
 import java.io.InputStream
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
-import java.nio.file.{Files, FileSystems, Path}
+import java.nio.file.{FileSystems, Files, Path}
 import java.util.concurrent.ConcurrentHashMap
 import java.util.stream.Collectors
 
 import bloop.bsp.BloopBspDefinitions.BloopExtraBuildParams
 import bloop.{CompileMode, Compiler, ScalaInstance}
 import bloop.cli.{Commands, ExitStatus, Validate}
-import bloop.data.{Platform, Project, ClientInfo}
+import bloop.data.{ClientInfo, Platform, Project}
 import bloop.engine.tasks.{CompileTask, Tasks, TestTask}
 import bloop.engine.tasks.toolchains.{ScalaJsToolchain, ScalaNativeToolchain}
 import bloop.engine._
@@ -19,13 +19,19 @@ import bloop.io.{AbsolutePath, RelativePath}
 import bloop.logging.{BspServerLogger, DebugFilter, Logger}
 import bloop.reporter.{BspProjectReporter, ProblemPerPhase, ReporterConfig, ReporterInputs}
 import bloop.testing.{BspLoggingEventHandler, TestInternals}
-
 import ch.epfl.scala.bsp
 import ch.epfl.scala.bsp.ScalaBuildTarget.encodeScalaBuildTarget
-import ch.epfl.scala.bsp.{BuildTargetIdentifier, MessageType, ShowMessageParams, endpoints}
+import ch.epfl.scala.bsp.{
+  BuildTargetIdentifier,
+  LaunchParametersDataKind,
+  MessageType,
+  ScalaMainClass,
+  ScalaTestParams,
+  ShowMessageParams,
+  endpoints
+}
 
 import scala.meta.jsonrpc.{JsonRpcClient, Response => JsonRpcResponse, Services => JsonRpcServices}
-
 import monix.eval.Task
 import monix.reactive.Observer
 import monix.execution.Scheduler
@@ -40,7 +46,10 @@ import scala.util.Success
 import scala.util.Failure
 import monix.execution.Cancelable
 import io.circe.Json
+import java.io
+
 import bloop.data.WorkspaceSettings
+import bloop.exec.JavaEnv
 
 final class BloopBspServices(
     callSiteState: State,
@@ -453,45 +462,67 @@ final class BloopBspServices(
     }
   }
 
+  // TODO propagade jvm opts
   def test(params: bsp.TestParams): BspEndpointResponse[bsp.TestResult] = {
+    def groupFilters: Either[Exception, Map[BuildTargetIdentifier, String => Boolean]] =
+      params.dataKind match {
+        case Some(LaunchParametersDataKind.scalaTestSuites) =>
+          params.data match {
+            case None =>
+              Left(new IllegalStateException(s"Missing data for $params"))
+            case Some(json) =>
+              json.as[ScalaTestParams].map { params =>
+                params.testClasses.map(x => (x.target, TestInternals.parseFilters(x.classes))).toMap
+              }
+          }
+        case None =>
+          Right(Map.empty) // for backwards compatibility
+      }
+
     def test(
         id: BuildTargetIdentifier,
         project: Project,
-        state: State
+        state: State,
+        filters: Map[BuildTargetIdentifier, String => Boolean]
     ): Task[State] = {
-      val testFilter = TestInternals.parseFilters(Nil) // Don't support test only for now
+      val testFilter = filters.getOrElse(id, (id: String) => true)
       val handler = new BspLoggingEventHandler(id, state.logger, client)
       Tasks.test(state, List(project), Nil, testFilter, handler, false)
     }
 
     val originId = params.originId
     ifInitialized(originId) { (state: State, logger: BspServerLogger) =>
-      mapToProjects(params.targets, state) match {
+      groupFilters match {
         case Left(error) =>
-          // Log the mapping error to the user via a log event + an error status code
-          logger.error(error)
-          Task.now((state, Right(bsp.TestResult(originId, bsp.StatusCode.Error, None, None))))
-        case Right(mappings) =>
-          val args = params.arguments.getOrElse(Nil)
-          compileProjects(mappings, state, args, originId, logger).flatMap {
-            case (newState, compileResult) =>
-              compileResult match {
-                case Right(result) =>
-                  val sequentialTestExecution = mappings.foldLeft(Task.now(newState)) {
-                    case (taskState, (tid, p)) => taskState.flatMap(state => test(tid, p, state))
-                  }
+          Task.now((state, Left(JsonRpcResponse.parseError(error.getMessage))))
+        case Right(filters) =>
+          mapToProjects(params.targets, state) match {
+            case Left(error) =>
+              // Log the mapping error to the user via a log event + an error status code
+              logger.error(error)
+              Task.now((state, Right(bsp.TestResult(originId, bsp.StatusCode.Error, None, None))))
+            case Right(mappings) =>
+              val args = params.arguments.getOrElse(Nil)
+              compileProjects(mappings, state, args, originId, logger).flatMap {
+                case (newState, compileResult) =>
+                  compileResult match {
+                    case Right(_) =>
+                      val sequentialTestExecution = mappings.foldLeft(Task.now(newState)) {
+                        case (taskState, (tid, p)) =>
+                          taskState.flatMap(state => test(tid, p, state, filters))
+                      }
 
-                  sequentialTestExecution.materialize.map(_.toEither).map {
-                    case Right(newState) =>
-                      (newState, Right(bsp.TestResult(originId, bsp.StatusCode.Ok, None, None)))
-                    case Left(e) =>
-                      //(newState, Right(bsp.TestResult(None, bsp.StatusCode.Error, None)))
-                      val errorMessage =
-                        JsonRpcResponse.internalError(s"Failed test execution: ${e.getMessage}")
-                      (newState, Left(errorMessage))
-                  }
+                      sequentialTestExecution.materialize.map(_.toEither).map {
+                        case Right(newState) =>
+                          (newState, Right(bsp.TestResult(originId, bsp.StatusCode.Ok, None, None)))
+                        case Left(e) =>
+                          val errorMessage =
+                            JsonRpcResponse.internalError(s"Failed test execution: ${e.getMessage}")
+                          (newState, Left(errorMessage))
+                      }
 
-                case Left(error) => Task.now((newState, Left(error)))
+                    case Left(error) => Task.now((newState, Left(error)))
+                  }
               }
           }
       }
@@ -525,6 +556,28 @@ final class BloopBspServices(
   }
 
   def run(params: bsp.RunParams): BspEndpointResponse[bsp.RunResult] = {
+    def getMainClass(project: Project, state: State): Either[Exception, ScalaMainClass] = {
+      params.dataKind match {
+        case Some(LaunchParametersDataKind.scalaMainClass) =>
+          params.data match {
+            case None =>
+              Left(new IllegalStateException(s"Missing data for $params"))
+            case Some(json) =>
+              json.as[ScalaMainClass]
+          }
+        case Some(kind) =>
+          Left(new IllegalArgumentException(s"Unsupported data kind: $kind"))
+        case None =>
+          val cmd = Commands.Run(List(project.name))
+          Interpreter.getMainClass(state, project, cmd.main) match {
+            case Right(name) =>
+              Right(new ScalaMainClass(name, cmd.args, Nil))
+            case Left(_) =>
+              Left(new IllegalStateException(s"Main class for project $project not found"))
+          }
+      }
+    }
+
     def run(
         id: BuildTargetIdentifier,
         project: Project,
@@ -532,31 +585,37 @@ final class BloopBspServices(
     ): Task[State] = {
       import bloop.engine.tasks.LinkTask.{linkMainWithJs, linkMainWithNative}
       val cwd = state.commonOptions.workingPath
-      val cmd = Commands.Run(List(project.name))
-      Interpreter.getMainClass(state, project, cmd.main) match {
-        case Left(state) =>
-          Task.now(sys.error(s"Failed to run main class in ${project.name}"))
+
+      getMainClass(project, state) match {
+        case Left(error) =>
+          Task.now(sys.error(s"Failed to run main class in $project due to: ${error.getMessage}"))
         case Right(mainClass) =>
           project.platform match {
             case Platform.Jvm(javaEnv, _, _) =>
-              Tasks.runJVM(state, project, javaEnv, cwd, mainClass, cmd.args.toArray, false)
+              val env = JavaEnv(javaEnv.javaHome, javaEnv.javaOptions ++ mainClass.jvmOptions)
+              val args = mainClass.arguments.toArray
+              Tasks.runJVM(state, project, env, cwd, mainClass.`class`, args, false)
             case platform @ Platform.Native(config, _, _) =>
+              val cmd = Commands.Run(List(project.name))
               val target = ScalaNativeToolchain.linkTargetFrom(project, config)
-              linkMainWithNative(cmd, project, state, mainClass, target, platform).flatMap {
-                state =>
+              linkMainWithNative(cmd, project, state, mainClass.`class`, target, platform)
+                .flatMap { state =>
                   val args = (target.syntax +: cmd.args).toArray
                   if (!state.status.isOk) Task.now(state)
-                  else Tasks.runNativeOrJs(state, project, cwd, mainClass, args)
-              }
+                  else Tasks.runNativeOrJs(state, project, cwd, mainClass.`class`, args)
+                }
             case platform @ Platform.Js(config, _, _) =>
+              val cmd = Commands.Run(List(project.name))
               val target = ScalaJsToolchain.linkTargetFrom(project, config)
-              linkMainWithJs(cmd, project, state, mainClass, target, platform).flatMap { state =>
-                // We use node to run the program (is this a special case?)
-                val args = ("node" +: target.syntax +: cmd.args).toArray
-                if (!state.status.isOk) Task.now(state)
-                else Tasks.runNativeOrJs(state, project, cwd, mainClass, args)
-              }
+              linkMainWithJs(cmd, project, state, mainClass.`class`, target, platform)
+                .flatMap { state =>
+                  // We use node to run the program (is this a special case?)
+                  val args = ("node" +: target.syntax +: cmd.args).toArray
+                  if (!state.status.isOk) Task.now(state)
+                  else Tasks.runNativeOrJs(state, project, cwd, mainClass.`class`, args)
+                }
           }
+
       }
     }
 
