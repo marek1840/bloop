@@ -42,8 +42,7 @@ import scala.collection.concurrent.TrieMap
 import scala.collection.JavaConverters._
 import scala.concurrent.Promise
 import scala.concurrent.duration.FiniteDuration
-import scala.util.Success
-import scala.util.Failure
+import scala.util.{Failure, Success, Try}
 import monix.execution.Cancelable
 import io.circe.Json
 import java.io
@@ -462,40 +461,24 @@ final class BloopBspServices(
     }
   }
 
-  // TODO propagade jvm opts
   def test(params: bsp.TestParams): BspEndpointResponse[bsp.TestResult] = {
-    def groupFilters: Either[Exception, Map[BuildTargetIdentifier, String => Boolean]] =
+    def parseParameters: Try[ScalaTestParams] = {
       params.dataKind match {
-        case Some(LaunchParametersDataKind.scalaTestSuites) =>
-          params.data match {
-            case None =>
-              Left(new IllegalStateException(s"Missing data for $params"))
-            case Some(json) =>
-              json.as[ScalaTestParams].map { params =>
-                params.testClasses.map(x => (x.target, TestInternals.parseFilters(x.classes))).toMap
-              }
-          }
+        case Some(kind @ LaunchParametersDataKind.scalaTestSuites) =>
+          params.data
+            .map(_.as[ScalaTestParams].toTry)
+            .getOrElse(Failure(new IllegalArgumentException(s"Missing data for data kind: $kind")))
         case None =>
-          Right(Map.empty) // for backwards compatibility
+          Success(new ScalaTestParams(Nil, Nil))
       }
-
-    def test(
-        id: BuildTargetIdentifier,
-        project: Project,
-        state: State,
-        filters: Map[BuildTargetIdentifier, String => Boolean]
-    ): Task[State] = {
-      val testFilter = filters.getOrElse(id, (id: String) => true)
-      val handler = new BspLoggingEventHandler(id, state.logger, client)
-      Tasks.test(state, List(project), Nil, testFilter, handler, false)
     }
 
     val originId = params.originId
     ifInitialized(originId) { (state: State, logger: BspServerLogger) =>
-      groupFilters match {
-        case Left(error) =>
+      parseParameters match {
+        case Failure(error) =>
           Task.now((state, Left(JsonRpcResponse.parseError(error.getMessage))))
-        case Right(filters) =>
+        case Success(testParams) =>
           mapToProjects(params.targets, state) match {
             case Left(error) =>
               // Log the mapping error to the user via a log event + an error status code
@@ -507,9 +490,20 @@ final class BloopBspServices(
                 case (newState, compileResult) =>
                   compileResult match {
                     case Right(_) =>
+                      val filters = testParams.testClasses
+                        .map(x => (x.target, TestInternals.parseFilters(x.classes)))
+                        .toMap
+
+                      val userOptions = testParams.jvmOptions.map(opt => s"-J$opt")
+
                       val sequentialTestExecution = mappings.foldLeft(Task.now(newState)) {
-                        case (taskState, (tid, p)) =>
-                          taskState.flatMap(state => test(tid, p, state, filters))
+                        case (taskState, (tid, project)) =>
+                          taskState.flatMap(state => {
+                            val testFilter = filters.getOrElse(tid, (_: String) => true)
+                            val handler = new BspLoggingEventHandler(tid, state.logger, client)
+                            val projects = List(project)
+                            Tasks.test(state, projects, userOptions, testFilter, handler, false)
+                          })
                       }
 
                       sequentialTestExecution.materialize.map(_.toEither).map {
