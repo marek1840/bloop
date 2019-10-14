@@ -491,7 +491,7 @@ final class BloopBspServices(
       }
     }
 
-    ifInitialized(None) { (state, logger) =>
+    ifInitialized(params.originId) { (state, logger) =>
       JavaEnv.loadJavaDebugInterface match {
         case Failure(exception) =>
           val message = JavaEnv.detectRuntime match {
