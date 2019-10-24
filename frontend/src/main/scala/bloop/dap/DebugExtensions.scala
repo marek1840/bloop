@@ -4,11 +4,13 @@ import java.util
 import java.util.Collections
 import java.util.concurrent.CompletableFuture
 import java.util.function.Consumer
-
 import com.microsoft.java.debug.core.IEvaluatableBreakpoint
 import com.microsoft.java.debug.core.adapter._
 import com.microsoft.java.debug.core.protocol.Types
-import com.sun.jdi.{ObjectReference, StackFrame, ThreadReference, Value}
+import com.sun.jdi.ObjectReference
+import com.sun.jdi.StackFrame
+import com.sun.jdi.ThreadReference
+import com.sun.jdi.Value
 import io.reactivex.Observable
 
 object DebugExtensions {
@@ -77,7 +79,10 @@ object DebugExtensions {
         uri: String,
         lines: Array[Int],
         columns: Array[Int]
-    ): Array[String] = Array()
+    ): Array[String] = {
+      val fqcn = uri.stripPrefix("jvm:fqcn:").replaceAll("/", ".")
+      lines.map(_ => fqcn)
+    }
 
     override def getSourceFileURI(fullyQualifiedName: String, sourcePath: String): String =
       sourcePath
@@ -85,7 +90,8 @@ object DebugExtensions {
   }
 
   object VirtualMachineManagerProvider extends IVirtualMachineManagerProvider {
-    import com.sun.jdi.{Bootstrap, VirtualMachineManager}
+    import com.sun.jdi.Bootstrap
+    import com.sun.jdi.VirtualMachineManager
     def getVirtualMachineManager: VirtualMachineManager = Bootstrap.virtualMachineManager
   }
 }
